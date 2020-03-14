@@ -70,7 +70,124 @@ void draw_dab_pixels_BlendMode_Normal (uint16_t * mask,
   }
 };
 
+
+#define MAX_BATCH_SIZE (100)
+
+void _batch_rgb_to_spectral(float *rgb_batch, float *spectral, unsigned int batch_size, unsigned int channels){
+    // TODO: Enable SIMD
+    // Its trricky because of the different sizes of rgb_batch and spectral
+    for(unsigned int i=0; i < batch_size; i++, spectral+=10, rgb_batch+=channels){
+        rgb_to_spectral(rgb_batch[0], rgb_batch[1], rgb_batch[2], spectral);
+    }
+}
+
+void _batch_spectral_to_rgb(float * rgb_batch, float * spectral, const unsigned int batch_size, unsigned int channels){ // TODO: Enable SIMD
+    // TODO: Enable SIMD
+    // Its trricky because of the different sizes of rgb_batch and spectral
+    for(int i=0; i < batch_size; i++, spectral+=10, rgb_batch+=channels){
+        spectral_to_rgb(spectral, rgb_batch);
+    }
+    return;
+}
+
+void _batch_pixels_BlendMode_Normal_Paint(float *spectral_rgb,
+                                              uint16_t opacity,
+                                              uint16_t *rgba_batch,
+                                              uint16_t *mask_batch,
+                                              const unsigned int items) {
+    // convert rgb to floats with baked alpha
+    // TODO: gcc won't autovec this if we keep it in one loop and only use SSE2.... annoying
+    // So to support SSE2 we need to put it in three loops. (AVX works finr with this tho)
+    float rgb_batch[3 * MAX_BATCH_SIZE];
+    for(unsigned int i=0; i < items; ++i){
+        rgb_batch[i * 3 + 0] = (float)rgba_batch[i * 4 + 0] / rgba_batch[i * 4 + 3];
+        rgb_batch[i * 3 + 1] = (float)rgba_batch[i * 4 + 1] / rgba_batch[i * 4 + 3];
+        rgb_batch[i * 3 + 2] = (float)rgba_batch[i * 4 + 2] / rgba_batch[i * 4 + 3];
+    }
+
+    // calculate fac_a and set output alpha channel
+    float fac_a[MAX_BATCH_SIZE];
+    for(unsigned int i=0; i < items; ++i){
+        uint32_t opa_a = mask_batch[i]*(uint32_t)opacity/(1<<15);
+        uint32_t opa_b = (1<<15)-opa_a; // bottomAlpha
+        uint32_t mixed_alpha = opa_a + opa_b * rgba_batch[i*4 + 3] / (1<<15);
+        rgba_batch[i*4 + 3] = mixed_alpha;
+        fac_a[i] = (float)opa_a / mixed_alpha;
+    }
+
+    // convert rgb to spectral
+    float spectral_b[MAX_BATCH_SIZE * 10] = {0};
+    _batch_rgb_to_spectral(rgb_batch, (float*)spectral_b, items, 3);
+
+    // Mix spectral colors
+    // TODO: complicated access pattern .. WTF ?????
+    // Tried unrolling it without any success .....
+    float spectral_result[MAX_BATCH_SIZE * 10];
+    for(unsigned int i=0; i < items; ++i){
+        /*
+         * for (int j=0; j<10; j++) {
+            spectral_result[i][j] = fastpow(spectral_rgb[j], fac_a[i]) * fastpow(spectral_b[i][j], 1.0 - fac_a[i]);
+        }
+        */
+        float _fac_a = fac_a[i];
+        float _fac_b = 1.0 - _fac_a;
+        for (int j=0; j<10; j++) {
+            const float foo = fastpow(spectral_rgb[j], _fac_a);
+            const float bar = fastpow(spectral_b[i * 10 + j], _fac_b);
+            spectral_result[i * 10 + j] = foo * bar;
+        }
+    }
+
+    // convert back to rgb
+    _batch_spectral_to_rgb(rgb_batch, spectral_result, items, 3);
+
+    // apply values
+    for(unsigned int i=0, src_i=0, dst_i=0; i < items; ++i, src_i+=3, dst_i+=4){
+        float alpha = rgba_batch[dst_i + 3];
+        rgba_batch[dst_i + 0] = (rgb_batch[src_i + 0] * alpha) + 0.5;
+        rgba_batch[dst_i + 1] = (rgb_batch[src_i + 1] * alpha) + 0.5;
+        rgba_batch[dst_i + 2] = (rgb_batch[src_i + 2] * alpha) + 0.5;
+    }
+}
+
+
 void draw_dab_pixels_BlendMode_Normal_Paint (uint16_t * mask,
+                                       uint16_t * rgba,
+                                       uint16_t color_r,
+                                       uint16_t color_g,
+                                       uint16_t color_b,
+                                       uint16_t opacity) {
+
+  // convert top to spectral.  Already straight color
+  float spectral_a[10] = {0};
+  rgb_to_spectral((float)color_r / (1 << 15), (float)color_g / (1 << 15), (float)color_b / (1 << 15), spectral_a);
+  // pigment-mode does not like very low opacity, probably due to rounding
+  // errors with int->float->int round-trip.  Once we convert to pure
+  // float engine this might be fixed.  For now enforce a minimum opacity:
+  opacity = MAX(opacity, 150);
+
+  unsigned int batch_items = 0;
+
+  uint16_t *mask_batch = mask;
+  uint16_t *rgba_batch = rgba;
+  while (1) {
+    mask_batch = mask;
+    rgba_batch = rgba;
+    batch_items = 0;
+    for (; mask[0] && batch_items < MAX_BATCH_SIZE; mask++, rgba+=4, batch_items++);
+    if (batch_items){
+        _batch_pixels_BlendMode_Normal_Paint(spectral_a, opacity, rgba_batch, mask_batch, mask[0] == 0 ? batch_items : batch_items);
+    }
+    if(mask[0] != 0){
+        continue;
+    }
+    if (!mask[1]) break;
+    rgba += mask[1];
+    mask += 2;
+  }
+};
+
+void draw_dab_pixels_BlendMode_Normal_Paint_ori (uint16_t * mask,
                                        uint16_t * rgba,
                                        uint16_t color_r,
                                        uint16_t color_g,
